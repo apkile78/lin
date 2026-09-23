@@ -1,0 +1,629 @@
+================================================================
+BROWSER VIRTUAL DESKTOP — FULL-SCOPE ARCHITECTURE PLAN
+================================================================
+Status: Planning complete. No open risks. Ready to build.
+Deployment target: GitHub Pages (static hosting)
+Approach: Custom, original architecture (QEMU-inspired, not copied)
+Scope: Full system from the start — no MVP/incremental scoping
+
+
+----------------------------------------------------------------
+0. PROJECT OVERVIEW
+----------------------------------------------------------------
+- Entire system runs in a browser tab, deployable to GitHub Pages
+- Supports multiple operating systems: Linux AND Windows
+- Supports multiple CPU architectures: x86_64, x86_32, and a
+  generalized framework for future arbitrary architectures (e.g. ARM)
+- Configurable CPU and RAM per VM instance
+- Multi-desktop/multi-configuration support:
+    * Multiple browser tabs can run different VMs simultaneously
+    * A single tab can host multiple VM configs (different
+      vCPU/vRAM), switchable between them
+- Full graphical desktop + application support — a completely
+  configurable environment running in a tab
+- No real networking (see section 9 — deliberately cut from scope)
+- Built entirely without Codespaces, AI-assisted coding, or local
+  dev tools — Chromebook is managed/locked down (no Linux/Crostini,
+  no Developer Mode, no DevTools, no installs/sideloading).
+  Primary editor: github.dev (browser-based VS Code via GitHub)
+
+
+----------------------------------------------------------------
+1. CPU ARCHITECTURE FRAMEWORK
+----------------------------------------------------------------
+- A generic CPU interface is exposed to the rest of the emulator
+  (memory manager, device bus, boot orchestration):
+    step()
+    readRegister(name) / writeRegister(name, value)
+    raiseInterrupt(vector)
+    getMode() / setMode()
+  The rest of the system only ever talks to this interface — it
+  never needs to know which architecture is actually running.
+
+- Architecture-specific logic (decode tables, register file shape,
+  flag semantics) lives BEHIND this interface, in swappable
+  per-architecture modules. Adding a new architecture later (e.g.
+  ARM) means writing one new module — no changes to the rest of
+  the emulator.
+
+- x86_64 and x86_32 are ONE shared module, not two separate
+  implementations. Real x86_64 CPUs run 32-bit code as a MODE of
+  the same physical core (legacy/protected mode vs. long mode),
+  not a different chip — the decoder has mode-dependent behavior
+  (operand size, register count, addressing) rather than fully
+  duplicated logic. This also matches real hardware behavior,
+  which matters for BIOS/bootloader compatibility.
+
+- 16-bit REAL MODE is a first-class mode the decoder must support
+  (not just protected/long mode), because firmware (section 4)
+  actually executes as real-mode code on this CPU core. Real mode
+  has its own addressing (segment:offset = segment*16 + offset),
+  different default operand/address sizes, and its own interrupt
+  vector table at address 0 (distinct from protected mode's IDT).
+
+- Full x86 integer instruction set (category summary):
+    Data movement: mov, push, pop, lea, xchg, movzx/movsx, cmovcc
+    Arithmetic: add, sub, adc/sbb, mul/imul, div/idiv, inc/dec,
+                neg, cmp
+    Logic/bitwise: and, or, xor, not, shl/shr, sar, rol/ror,
+                   bt/bts/btr
+    Control flow: jmp + all jcc conditional variants (~30), call,
+                  ret, loop, int
+    Stack/frame: push/pop, enter/leave
+    String/memory block ops: movs, stos, cmps, scas, lods
+                              (with rep/repne prefixes)
+    Privileged/system (ring 0): cli/sti, hlt, lgdt/lidt,
+                                 mov to/from CR0-CR4, in/out, iret
+
+
+----------------------------------------------------------------
+2. MEMORY MODEL — x86 MMU
+----------------------------------------------------------------
+DECISION: Built fully self-contained (Option A) — x86's MMU
+(segmentation + paging together) is NOT built on top of a shared
+generic MMU module. A generic/shared MMU abstraction will only be
+extracted later, once a second real architecture implementation
+(e.g. ARM) exists to generalize from — building it blind now would
+mean guessing at requirements with no second data point.
+
+Two-layer x86 memory model:
+
+  A) SEGMENTATION (mostly vestigial in 64-bit long mode, fully
+     active/required in 32-bit protected mode)
+     - Segment registers: CS, DS, SS, ES, FS, GS
+     - GDT (Global Descriptor Table): array of 8-byte descriptors,
+       each with base address, limit, access/flags byte
+     - In 32-bit mode: every memory access resolves the active
+       segment register -> GDT entry -> checks access is within
+       [base, base+limit] -> adds segment base to the linear
+       address BEFORE it goes into the paging walker below
+     - In long mode: segment bases mostly forced to 0, limits
+       ignored — EXCEPT FS/GS, which real OSes repurpose for
+       thread-local storage, so FS/GS base offset support is
+       still required even in 64-bit mode
+
+  B) PAGING (the layer that matters most for running real OSes)
+     - Page table walker: given a virtual address + current CR3 +
+       current mode, walks the table levels (2-level for 32-bit,
+       3-level for PAE, 4-level for long mode), extracting index
+       bits per level, following entries to the next table level
+       until reaching a page frame
+     - At each level: checks the PRESENT bit (fault if 0) and
+       permission bits (writable, user/supervisor) against the
+       access being attempted
+     - Mode-dependent table format: the walker branches behavior
+       based on current mode (32-bit non-PAE 4KB entries / 32-bit
+       PAE 3-level / 64-bit long mode 4-level, 5-level variant for
+       newer extensions)
+
+TLB (translation cache):
+  - UNBOUNDED — a plain cache (JS Map) with no eviction, not
+    modeling realistic finite-size/LRU hardware behavior. Simpler
+    to implement, functionally identical for correctness since
+    fidelity to real cache-timing behavior is not a goal.
+  - KEYED BY (CR3, virtual page number) — a composite key, NOT a
+    full-flush-on-CR3-change approach. This retains cached
+    translations across process context switches instead of
+    losing them all on every switch (closer to what real hardware
+    achieves via PCID, without needing to implement PCID itself).
+    This design also composes cleanly with multi-core (section 7):
+    since CR3 is part of the key, multiple cores running different
+    processes simultaneously stay correct automatically.
+  - invlpg (single-page invalidate): uses the CURRENT CR3 as half
+    the key — Map.delete((currentCR3, thatVirtualPage)) — since
+    invlpg always runs in the context of whatever process is
+    currently executing.
+  - FAITHFUL HARDWARE REPLICATION for invalidation: the guest OS
+    must call invlpg correctly, exactly like real hardware. NO
+    auto-detection of stale TLB entries when page tables are
+    edited — matches what real unmodified Linux/Windows kernels
+    already expect and is simpler to implement (nothing to detect).
+
+Page fault (interrupt 14) generation:
+  - Triggered on: page not present, OR permission violation
+    (write to read-only page, user-mode access to supervisor page)
+  - Must set CR2 to the faulting virtual address
+  - Must push an error code with exact bit meanings:
+      bit 0 = present/not-present
+      bit 1 = read/write
+      bit 2 = user/supervisor
+      bit 3 = reserved-bit violation
+      bit 4 = instruction fetch
+    Guest kernels' fault handlers decode these bits exactly, so
+    they must be correct, not approximated.
+
+
+----------------------------------------------------------------
+3. FIRMWARE / BIOS LAYER
+----------------------------------------------------------------
+DECISION: Firmware is built as REAL 16-bit real-mode code that
+EXECUTES ON THE EMULATOR'S OWN CPU CORE — authentic, like real
+BIOS/SeaBIOS — not faked/intercepted in host JavaScript. This was
+chosen over the faster host-intercept approach.
+  - The faked/intercepted-in-JS approach MAY be added later as an
+    optional "BIOS optimization mode" toggle, but is not the
+    primary design.
+  - Authoring approach (hybrid): Pi writes the actual real-mode
+    firmware code by hand, but references existing open-source
+    BIOS implementations (e.g. SeaBIOS) for calling-convention and
+    behavioral logic — not copying code, just using it as a
+    behavioral reference rather than researching BIOS conventions
+    from scratch.
+
+Two boot paths exist:
+  1) DIRECT-INJECT — bypasses firmware entirely. Boot shim loads a
+     kernel binary straight into memory, sets up CR3/GDT/paging
+     manually, jumps directly to the kernel's entry point per the
+     Linux boot protocol. Fastest, simplest. Used for Linux by
+     default, especially for custom-built kernels.
+  2) FULL-FIRMWARE — CPU starts at the reset vector (physical
+     address 0xFFFF0, real mode, a jmp instruction there jumps into
+     firmware code, mirroring how real BIOS ROMs are mapped).
+     Firmware runs, reads MBR/GPT from the virtual disk, loads the
+     real bootloader (GRUB or Windows Boot Manager), which takes
+     over from there — calling back into firmware's INT 13h/10h
+     handlers as needed. REQUIRED for Windows (no shortcut exists).
+     Optional realistic path for Linux via GRUB (enables booting
+     unmodified Linux install ISOs, not just custom kernels).
+
+Firmware internals to implement:
+  - Reset vector: jmp at 0xFFFF0 into firmware entry code
+  - INT 13h (disk services): reads/writes "sectors" by translating
+    CHS/LBA addressing into offsets into the IndexedDB-backed
+    virtual disk
+  - INT 10h (video services): text-mode character output (writes
+    to video memory at 0xB8000) and basic mode-setting
+  - INT 15h (E820 memory map): returns a table describing
+    available RAM regions
+  - MBR emulation / boot sector loading: firmware reads sector 0
+    of the virtual disk into memory at 0x7C00, verifies the boot
+    signature, jumps to it
+
+LEGACY BIOS vs UEFI:
+  DECISION: Planning for BOTH legacy BIOS and UEFI, not
+  legacy-only. Needed because modern Windows (8+) defaults to UEFI
+  boot, not legacy/CSM-compatible boot.
+  DECISION: Legacy BIOS and UEFI are FULLY INDEPENDENT firmware
+  implementations — a setup-time either/or choice per VM config
+  (like picking "BIOS" vs "UEFI" in a real VM's settings), NOT a
+  shared/unified abstraction layer. They share almost nothing
+  architecturally (see below), so independence is simpler to
+  reason about and matches how real motherboards/VMs expose it.
+
+  UEFI specifics (fundamentally different from legacy BIOS):
+    - No interrupt-based services (no INT 13h/10h/15h) — instead
+      exposes a table of FUNCTION POINTERS (Boot Services and
+      Runtime Services) that the bootloader calls directly
+    - Runs in 32-bit or 64-bit protected/long mode from the start,
+      NOT 16-bit real mode — a genuinely separate boot flow from
+      legacy BIOS, doesn't need the real-mode decoder work
+    - Disk layout: GPT (GUID Partition Table) instead of MBR, with
+      a dedicated EFI System Partition (FAT32-formatted) containing
+      the bootloader as a .efi PE-format executable
+      (Windows: \EFI\Microsoft\Boot\bootmgfw.efi)
+    - Core pieces to implement:
+        * GPT parser (locate the EFI System Partition)
+        * Minimal FAT32 driver (read files off that partition —
+          legacy BIOS never needed a filesystem driver, since it
+          just reads raw sectors)
+        * PE/COFF loader (parse a .efi file's headers, map its
+          sections into memory, jump to its entry point)
+        * UEFI Boot Services table (AllocatePages, LocateProtocol,
+          ExitBootServices, etc. — enough for Windows Boot Manager
+          to hand off to winload.efi and the kernel)
+        * UEFI Runtime Services (smaller set that stays available
+          AFTER boot — variable services, time services — the
+          running kernel may call back into these)
+
+
+----------------------------------------------------------------
+4. FPU / SIMD
+----------------------------------------------------------------
+DECISION: Full x87 + SSE + AVX planned now, not deferred.
+DECISION: x87, SSE, and AVX are THREE SEPARATE internal register
+files and decode tables within the x86 module — NOT part of the
+generic CPU interface, since ARM has nothing resembling x87's
+stack model. The x86 module's decoder recognizes which family an
+opcode belongs to (legacy x87 opcodes, legacy SSE opcodes with 0F
+prefix bytes, VEX-prefixed AVX opcodes) and dispatches to the
+matching execution logic and register file.
+
+x87 FPU (legacy floating point):
+  - 8 registers (ST0-ST7), organized as a STACK (not flat) — most
+    instructions implicitly operate on "top of stack"; a tag word
+    tracks which registers are valid/empty
+  - 80-bit extended precision internally (even though it
+    loads/stores 32/64-bit floats)
+  - Control/status words: rounding mode, exception masks,
+    condition codes (compare results)
+  - Instructions: fld/fst, fadd/fsub/fmul/fdiv, fcom, transcendentals
+    (fsin, fcos, fsqrt), stack management (ffree, fxch)
+  DECISION (phased, easier first): build the 64-bit JS-double
+  APPROXIMATION first (JS numbers are 64-bit floats; simpler,
+  works for typical guest code, everyday code rarely depends on
+  the extra 16 bits of precision). TRUE 80-BIT EXTENDED-PRECISION
+  emulation is a later, harder upgrade pass once the pipeline
+  (dispatch, register semantics, control flow) is proven correct
+  with the simple approximation. Get the whole system working
+  end-to-end first; don't debug precision bugs and dispatch bugs
+  simultaneously.
+
+SSE (128-bit vector, integer + float):
+  - 16 registers (XMM0-XMM15 in 64-bit mode, 8 in 32-bit), 128
+    bits each, FLAT (not stack-based — simpler addressing than x87)
+  - Operates on packed data (4x32-bit floats, 2x64-bit floats,
+    various packed integer widths) — the INSTRUCTION determines
+    interpretation, not the register itself
+  - Instructions: movaps/movups, addps/addss, comparisons,
+    shuffle/pack/unpack (data rearrangement, numerous and fiddly),
+    int/float conversions
+
+AVX (256-bit extension):
+  - Extends SSE's XMM registers to 256-bit YMM registers — the low
+    128 bits of each YMM register IS the corresponding XMM
+    register (same physical storage, different access width per
+    instruction, not a separate register)
+  - Introduces the VEX prefix encoding — a genuinely different
+    instruction encoding scheme, three-operand form
+    (dest = src1 op src2) instead of SSE's two-operand form
+    (dest = dest op src) — requires a real second decoder path,
+    not just "more opcodes"
+
+
+----------------------------------------------------------------
+5. OS-SPECIFIC BOOT PATHS
+----------------------------------------------------------------
+LINUX — two paths:
+  1) Direct-inject (default fast path) — see section 3
+  2) Full-firmware via GRUB (realistic path) — reset vector -> 
+     real-mode firmware -> MBR/GPT -> GRUB runs AS REAL-MODE CODE
+     ON THE CPU CORE -> reads config -> loads kernel+initrd from
+     virtual disk via INT 13h handler -> GRUB switches to
+     protected mode itself -> jumps to kernel. Enables booting
+     unmodified Linux install ISOs (Ubuntu, Alpine, etc.) without
+     special preparation.
+
+WINDOWS — full-firmware only, no shortcut exists:
+  - Windows Boot Manager (bootmgr) requires real firmware services
+    (calls INT 13h extensively during early boot on legacy BIOS;
+    expects INT 15h/E820 memory map; needs either legacy BIOS or
+    UEFI services present)
+  - Boot sequence: reset vector -> firmware -> MBR/GPT -> Windows
+    Boot Manager loads -> reads BCD (Boot Configuration Data) ->
+    loads winload.exe (or winload.efi on UEFI) -> loads the actual
+    Windows kernel (ntoskrnl.exe) and drivers
+  - BOTH legacy BIOS and UEFI paths are supported (see section 3),
+    since modern Windows (8+) defaults to UEFI boot
+
+
+----------------------------------------------------------------
+6. DEPLOYMENT / AVAILABILITY MODEL
+----------------------------------------------------------------
+CRITICAL CONSTRAINT: OS images (Windows, Linux distros, etc.) must
+ALL be pre-built and available/selectable at VM setup time from
+storage. Users must NEVER have to trigger or wait for a GitHub
+Actions build (which could take ~16 hours for the full matrix) in
+order to use an OS. Actions builds happen ahead of time, controlled
+by Pi — never on-demand per user.
+
+  - BUILD TIME (Pi's Actions workflow, manually triggered) ->
+    produces finished artifacts (kernel binaries, firmware images,
+    pre-made disk images) -> deploys to gh-pages branch / GitHub
+    Releases
+  - RUNTIME (a user opening the site) -> setup UI reads a MANIFEST
+    file (e.g. /available-images.json on gh-pages, listing what's
+    available: which OSes, architectures, firmware type, download
+    size) -> user picks one -> browser fetches the already-built
+    artifact directly. No compilation ever happens client-side or
+    on-demand.
+
+DECISION: Workflow uses workflow_dispatch (manual "Run workflow"
+trigger), NOT on: push. Takes input parameters (which target(s) to
+build — a dropdown/checklist, or "all").
+DECISION: Per-target/path-based structure — separate jobs per
+target (matrix build or individual jobs), each conditionally
+skipped unless its target was selected. Pushing/running a build for
+one target (e.g. "Alpine x86_64") only rebuilds that target, NOT
+the entire matrix every time.
+  - On completion, each successful job updates just its own entry
+    in the manifest — partial builds (one OS done, others not yet)
+    are reflected accurately without requiring every target to
+    succeed.
+
+Linux kernel build approach:
+  - Kernel source: Long-term stable (LTS, e.g. 6.1, 5.15)
+  - Build approach: Buildroot to compile a minimal custom kernel;
+    pre-built binary as fallback
+  - Multi-distro support: Alpine, Arch, Ubuntu with separate
+    configs in /kernel-configs/
+  - Storage: gh-pages branch for immediate browser testing (no
+    runtime download needed); GitHub Releases as a manual opt-in
+    for permanent/stable build artifacts; binaries NEVER committed
+    to the main repo
+
+
+----------------------------------------------------------------
+7. DEVICE MODEL + MULTI-CORE
+----------------------------------------------------------------
+Disk controller:
+  - IDE/ATA implemented FIRST (simple register interface,
+    universally supported by every guest OS including old ones)
+  - AHCI added LATER as an option (what modern OSes expect by
+    default for better compatibility/performance)
+  - Both backed by the IndexedDB virtual disk — controller
+    emulation speaks the correct register-level protocol so guest
+    drivers work unmodified, translates to IndexedDB gets/puts
+
+Input:
+  - 8042 PS/2 controller emulation — legacy but universally
+    supported by every BIOS/OS driver, even on modern systems
+  - Keyboard: translate browser keydown/keyup events into PS/2
+    scancodes, feed into the emulated controller's buffer
+  - Mouse: PS/2 mouse protocol (movement deltas + button state),
+    needed for the graphical desktop phase
+
+Timer:
+  - PIT (Programmable Interval Timer) as baseline — guest OS
+    programs it to fire interrupts at a fixed rate (drives the
+    OS's internal clock tick, scheduler timeslices)
+  - RTC (Real-Time Clock) for wall-clock date/time
+  - APIC timer deferred (modern OSes prefer it, but PIT is the
+    universally-supported starting point)
+  - Implementation: a JS setInterval/requestAnimationFrame-driven
+    loop that calls raiseInterrupt() at the configured rate
+
+Video/framebuffer:
+  - VGA TEXT MODE — writes to memory at 0xB8000 (character+color
+    byte pairs), used by firmware/early boot output
+  - LINEAR FRAMEBUFFER MODE — a flat pixel array rendered to a
+    <canvas>, for the graphical desktop phase (X11, Windows GUI
+    expect this, not just text mode)
+  - Guest switches between these via INT 10h (BIOS) calls during
+    real-mode boot, or VBE (VESA BIOS Extensions)-style mode
+    programming for higher resolutions
+
+Interrupt controller:
+  - PIC (8259) as baseline — simple, single chip, fixed 15 IRQ lines
+  - APIC/IOAPIC REQUIRED (not deferred) because multi-core is
+    built in from day one (see below) — routes device IRQs to the
+    correct core's raiseInterrupt(), and handles inter-processor
+    interrupts (IPIs) for core-to-core coordination
+
+MULTI-CORE / MULTI-VCPU:
+  DECISION: BOTH single-vCPU (default/baseline config) AND full
+  multi-core/multi-vCPU support are in scope — not single-core
+  only.
+  DECISION: Multi-core is built as an INTEGRAL PART OF THE INITIAL
+  CPU MODULE FROM DAY ONE. Worker/SharedArrayBuffer/APIC plumbing
+  exists from the start; single-core is simply the N=1 case. NOT
+  deferred as a second pass added after single-core is proven —
+  no phased/incremental approach here.
+
+  How cores share the machine:
+    - Each vCPU core is a separate instance of the CPU module (own
+      registers, own decode state) — but ALL cores share the SAME
+      memory space and SAME MMU/page tables (matches real hardware)
+    - Each vCPU driven by a SEPARATE WEB WORKER (true parallelism
+      requires real OS threads; JS itself is single-threaded)
+    - Shared RAM backed by a SharedArrayBuffer (not a regular
+      ArrayBuffer), so all Worker threads read/write the same
+      underlying memory
+
+  SharedArrayBuffer requirement — RESOLVED:
+    - SharedArrayBuffer requires COOP/COEP HTTP response headers,
+      which GitHub Pages does NOT support setting natively (no
+      _headers/.htaccess-equivalent config on static Pages hosting)
+    - RESOLVED via the coi-serviceworker client-side workaround —
+      a service worker that intercepts fetches and injects the
+      required headers, making crossOriginIsolated === true even
+      though GitHub Pages itself never sends those headers
+    - Pi has ALREADY PROVEN this exact approach working in the
+      cdda-web-build project (CDDA compiled to WASM, deployed to
+      GitHub Pages under the same Chromebook constraints) — no new
+      research needed, just reuse the same service worker here
+
+  IPIs (Inter-Processor Interrupts):
+    - Real multi-core coordination relies on cores interrupting
+      each other (wake up, flush TLB, handle a task) — this is the
+      APIC's actual purpose beyond being "a fancier PIC"
+    - Each virtual core needs its own Local APIC
+    - A shared IOAPIC routes device interrupts to whichever core
+      should handle them
+    - Real protocol work: APIC has its own register interface and
+      interrupt delivery modes (fixed, lowest-priority, etc.)
+
+  MMU/TLB implication: the (CR3, page) composite TLB key from
+  section 2 already composes cleanly with multi-core — each core's
+  TLB lookups stay correct even with multiple cores running
+  different processes simultaneously, since CR3 is already part of
+  the cache key. No redesign needed.
+
+
+----------------------------------------------------------------
+8. MULTI-INSTANCE ARCHITECTURE
+----------------------------------------------------------------
+MULTIPLE TABS, each running an independent VM:
+  - Each browser tab is already a fully isolated JS environment by
+    browser design (separate memory, separate Workers) — this
+    falls out "for free," no cross-tab coordination code needed
+    (especially since networking/cross-VM communication is cut,
+    see section 9)
+  - The only real requirement: VM state/config must be
+    saveable/reloadable (a storage-layer concern, section 10) so a
+    second tab starts a DIFFERENT VM instance rather than colliding
+
+ONE TAB, multiple switchable VM configs:
+  - A VM MANAGER layer sits above individual VM instances: tracks
+    which configs exist, which is "active," handles pause/resume
+    transitions
+  - Only ONE VM instance is actively running (consuming
+    CPU/Worker cycles) per tab at a time — others are suspended
+
+  DECISION: Suspended VMs are KEPT ALIVE BUT IDLE — Worker threads
+  stay allocated, they simply stop calling step(). Everything
+  stays exactly in place in memory, trivially resumable (instant
+  switch, no serialize/deserialize needed).
+    - Tradeoff knowingly accepted: each suspended VM continues to
+      hold its full Worker pool and memory allocation even while
+      doing nothing. Multiple suspended VMs = multiple full memory
+      allocations sitting idle. This was an explicit, deliberate
+      choice over the alternative (fully terminate Workers,
+      serialize state out to plain objects, cheaper on resources
+      but requires clean serialize/deserialize logic for every
+      piece of CPU/device state, and slower to resume).
+
+  Architectural shape:
+    Tab
+     └── VM Manager (tracks configs, active/suspended state)
+          ├── VM Instance A (active)    — N Worker-backed vCPUs,
+          │                               SharedArrayBuffer RAM,
+          │                               devices, all running
+          ├── VM Instance B (suspended) — Workers alive, idle
+          └── VM Instance C (suspended) — Workers alive, idle
+
+
+----------------------------------------------------------------
+9. STORAGE DESIGN
+----------------------------------------------------------------
+IndexedDB object stores:
+  - os-images    — base OS image/kernel/firmware artifacts
+                    downloaded from gh-pages (read-only reference
+                    copies, SHARED across VM instances — multiple
+                    VMs using the same base Ubuntu image don't
+                    each need their own copy)
+  - vm-configs   — metadata per VM instance: name, which OS image
+                    it's based on, architecture, firmware type
+                    (BIOS/UEFI), vCPU count, RAM size, disk size
+                    (small, cheap to store many of)
+  - vm-disks     — the actual per-VM virtual hard disk contents
+                    (installed software, user files, OS-specific
+                    state written after boot — likely the LARGEST
+                    storage consumer)
+  - vm-snapshots — full CPU+RAM+device state serialized, for
+                    resuming a VM across a full BROWSER RESTART
+                    (not just a tab-switch, which is handled by the
+                    kept-alive-but-idle approach in section 8)
+
+DECISION: Disk storage (vm-disks) is CHUNKED FROM THE START — e.g.
+4-16MB records per virtual disk, with a chunk-index/mapping layer
+translating "virtual disk sector N" to "which IndexedDB record
+holds it." NOT single-blob-per-disk.
+  - Rationale: large blobs (a multi-GB Windows disk image) hit
+    practical size hiccups in some browsers when stored as one
+    giant blob, and a single-blob approach means potentially
+    serializing the ENTIRE disk on every write. Chunking avoids
+    this and makes partial updates (writing back just the sectors
+    that changed) far cheaper than rewriting a multi-GB blob.
+  - Tradeoff knowingly accepted: more upfront complexity (a
+    chunk-index/mapping layer is required), in exchange for disk
+    I/O that stays cheap regardless of how large disks grow.
+
+
+----------------------------------------------------------------
+10. NETWORKING — EXPLICITLY CUT FROM SCOPE
+----------------------------------------------------------------
+DECISION: Real guest-OS networking (TCP/UDP access to the actual
+internet from inside the emulated guest) is CUT ENTIRELY from the
+plan — not deferred to a "later phase," genuinely out of scope for
+now. This is a solo project with no team to maintain extra
+infrastructure, and networking is the one piece that structurally
+cannot be solved client-side.
+
+Why this is a hard technical wall, not a design gap:
+  - No browser context (main thread, Web Worker, Service Worker,
+    WASM running in any of them) has access to raw TCP/UDP
+    sockets. This is a deliberate, universal, permanent browser
+    security boundary — not a gap that will be filled by future
+    browser versions, not something WASM escapes (WASM in a
+    browser runs in the exact same sandbox; only WASI runtimes
+    OUTSIDE a browser, like wasmtime, can do real sockets)
+  - The ONLY functions any browser JS/WASM context can use to move
+    bytes anywhere outside the page: fetch(), XMLHttpRequest,
+    WebSocket, WebRTC. That is the complete list — nothing else
+    exists to call, on any browser, by design
+  - A managed Chromebook additionally blocks every on-device
+    workaround that might exist on other machines: no Crostini
+    (real Linux networking), no Developer Mode, no extension
+    sideloading, no native app installation
+
+What DOES work without any networking at all (i.e. most real use
+cases are unaffected):
+  - Any single-player game or application with no online features
+    — downloaded/sideloaded into the guest's virtual disk, it runs
+    entirely on CPU emulation + disk I/O + graphics + audio, none
+    of which touch a network stack
+  - Local file operations, installs from local media, save/load
+  - Anything using only hardware abstractions (audio, input,
+    video/framebuffer, clock/timer)
+
+What WOULD need networking (out of scope for this project):
+  - Multiplayer/online games, matchmaking
+  - DNS lookups, runtime downloads from inside the guest (apt/apk,
+    curl/wget, launcher "check for updates")
+  - NTP time sync (most OSes fall back gracefully without it)
+  - SSH in/out of the guest
+  - Any client-server app relying on live network access
+
+IF real guest networking is ever revisited in the future (not
+currently planned), the only architecturally valid approach is a
+small hosted backend (e.g. Render, Fly.io, a VPS) acting as a
+WebSocket-to-real-TCP/UDP proxy — the guest's virtual NIC would
+speak a Slirp-style protocol over WebSocket to that proxy, which
+performs real connect() calls on the guest's behalf. This was
+explicitly rejected for now specifically because it requires
+maintaining a second piece of always-on infrastructure, which
+doesn't fit a solo, backend-free project.
+
+
+----------------------------------------------------------------
+11. WORKING METHOD / CONSTRAINTS
+----------------------------------------------------------------
+- Solo project — Pi is building this alone
+- No Codespaces, no AI-assisted coding tools, no local dev
+  environment — everything is done through browser-only tools
+- Primary editor: github.dev (press "." on the repo, or change
+  github.com to github.dev in the URL) — full VS Code editing
+  experience with no install
+- Claude's role in this project: PLANNING/ARCHITECTURE ONLY — no
+  code, no files written by Claude for the implementation itself.
+  Pi builds everything by hand in github.dev.
+- GitHub Actions cloud runners handle anything requiring a real
+  compiler/build toolchain (kernel compilation, etc.) that can't
+  run on the Chromebook itself
+- Repo structure (initial sketch, will expand):
+    /src                              - VM code (JavaScript)
+    /kernel-configs                   - Buildroot configs per-distro
+    /index.html                       - Entry point
+    /.github/workflows/build-kernel.yml - Manually-triggered,
+                                           per-target build workflow
+
+  gh-pages branch structure:
+    /kernels/<distro>/vmlinuz  - One per distro
+    /available-images.json    - Manifest read by setup UI
+    /index.html                - Served to users
+    /src/                       - Served to users
+
+
+================================================================
+END OF PLAN
+================================================================
