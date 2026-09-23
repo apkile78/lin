@@ -4,7 +4,7 @@
 
 A full-featured, original x86 PC emulator that runs entirely in a browser tab, deployed as a static site on GitHub Pages. No plugins, no installs, no server — boot real Linux or Windows inside a webpage.
 
-This is a solo project, built from scratch (QEMU-inspired architecture, but completely original — no borrowed code), under real constraints: a locked-down/managed Chromebook with no Linux, no Developer Mode, no DevTools, no installs, and no AI-assisted coding tools. Everything is written by hand in [github.dev](https://github.dev) (press `.` on this repo, or swap `github.com` → `github.dev` in the URL).
+This is a solo project, built from scratch. (QEMU-inspired architecture, but completely original — no borrowed code)
 
 ## What it does
 
@@ -55,7 +55,7 @@ See `full-scope-plan.txt` in this repo for the complete, detailed design doc cov
 ## Scope — what's intentionally *not* here
 
 - **No real networking.** Guest OSes can't reach the actual internet — this is a hard browser sandboxing limit (no raw sockets are exposed to any web page, ever, by any browser), not a bug. Anything that only needs the virtual disk — offline games, local tools, sideloaded software — works fine. Anything needing a live connection (multiplayer, package managers, license checks) won't.
-- **No AI-assisted or Codespaces-based development.** Every line is written by hand.
+- *Games or Programs which need to be either installed via networking or added onto disc for a want to be vm function need to be installed via workflows.
 
 ## Repo structure
 
